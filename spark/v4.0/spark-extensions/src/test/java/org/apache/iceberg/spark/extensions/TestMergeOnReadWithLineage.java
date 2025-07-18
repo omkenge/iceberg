@@ -16,6 +16,20 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-package org.apache.iceberg.flink;
+package org.apache.iceberg.spark.extensions;
 
-public class IcebergConnectorSmokeTest extends TestIcebergConnector {}
+import java.util.Map;
+import org.apache.iceberg.RowLevelOperationMode;
+import org.apache.iceberg.TableProperties;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
+
+public class TestMergeOnReadWithLineage extends TestRowLevelOperationsWithLineage {
+
+  @Override
+  protected Map<String, String> extraTableProperties() {
+    return ImmutableMap.of(
+        TableProperties.MERGE_MODE, RowLevelOperationMode.MERGE_ON_READ.modeName(),
+        TableProperties.UPDATE_MODE, RowLevelOperationMode.MERGE_ON_READ.modeName(),
+        TableProperties.DELETE_MODE, RowLevelOperationMode.MERGE_ON_READ.modeName());
+  }
+}
