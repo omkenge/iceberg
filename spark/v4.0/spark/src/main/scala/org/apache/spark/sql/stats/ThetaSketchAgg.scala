@@ -16,7 +16,6 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-
 package org.apache.spark.sql.stats
 
 import java.nio.ByteBuffer
@@ -34,7 +33,6 @@ import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.expressions.aggregate.ImperativeAggregate
 import org.apache.spark.sql.catalyst.expressions.aggregate.TypedImperativeAggregate
 import org.apache.spark.sql.catalyst.trees.UnaryLike
-import org.apache.spark.sql.functions.col
 import org.apache.spark.sql.types.BinaryType
 import org.apache.spark.sql.types.DataType
 import org.apache.spark.sql.types.Decimal
@@ -47,12 +45,13 @@ import org.apache.spark.unsafe.types.UTF8String
  * which should be deserialized to Compact sketch before using.
  *
  * See [[https://iceberg.apache.org/puffin-spec/]] for more information.
- *
  */
 case class ThetaSketchAgg(
-     child: Expression,
-     mutableAggBufferOffset: Int = 0,
-     inputAggBufferOffset: Int = 0) extends TypedImperativeAggregate[Sketch] with UnaryLike[Expression] {
+    child: Expression,
+    mutableAggBufferOffset: Int = 0,
+    inputAggBufferOffset: Int = 0)
+    extends TypedImperativeAggregate[Sketch]
+    with UnaryLike[Expression] {
 
   private lazy val icebergType = SparkSchemaUtil.convert(child.dataType)
 
@@ -103,7 +102,8 @@ case class ThetaSketchAgg(
     CompactSketch.wrap(Memory.wrap(storageFormat))
   }
 
-  override def withNewMutableAggBufferOffset(newMutableAggBufferOffset: Int): ImperativeAggregate = {
+  override def withNewMutableAggBufferOffset(
+      newMutableAggBufferOffset: Int): ImperativeAggregate = {
     copy(mutableAggBufferOffset = newMutableAggBufferOffset)
   }
 

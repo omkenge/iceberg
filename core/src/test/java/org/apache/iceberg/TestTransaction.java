@@ -170,6 +170,18 @@ public class TestTransaction extends TestBase {
         ids(appendSnapshot.snapshotId(), appendSnapshot.snapshotId()),
         files(FILE_A, FILE_B),
         statuses(Status.ADDED, Status.ADDED));
+
+    // validate snapshot summaries for manifest metrics
+    assertThat(appendSnapshot.summary())
+        .containsEntry(SnapshotSummary.CREATED_MANIFESTS_COUNT, "1")
+        .containsEntry(SnapshotSummary.KEPT_MANIFESTS_COUNT, "0")
+        .containsEntry(SnapshotSummary.REPLACED_MANIFESTS_COUNT, "0");
+
+    // delete rewrites the append manifest
+    assertThat(deleteSnapshot.summary())
+        .containsEntry(SnapshotSummary.CREATED_MANIFESTS_COUNT, "1")
+        .containsEntry(SnapshotSummary.KEPT_MANIFESTS_COUNT, "0")
+        .containsEntry(SnapshotSummary.REPLACED_MANIFESTS_COUNT, "1");
   }
 
   @TestTemplate
@@ -654,7 +666,7 @@ public class TestTransaction extends TestBase {
 
     ManifestFile newManifest =
         writeManifest(
-            "manifest-file-1.avro",
+            manifestFormat().addExtension("manifest-file-1"),
             manifestEntry(ManifestEntry.Status.EXISTING, firstSnapshotId, FILE_A),
             manifestEntry(ManifestEntry.Status.EXISTING, secondSnapshotId, FILE_B));
 
@@ -765,7 +777,7 @@ public class TestTransaction extends TestBase {
   @TestTemplate
   public void testRowDeltaWithConcurrentManifestRewrite() throws IOException {
     assumeThat(formatVersion).isEqualTo(2);
-    String branch = "main";
+    String branch = SnapshotRef.MAIN_BRANCH;
     RowDelta rowDelta = table.newRowDelta().addRows(FILE_A).addDeletes(FILE_A_DELETES);
     Snapshot first = commit(table, rowDelta, branch);
 
@@ -799,7 +811,7 @@ public class TestTransaction extends TestBase {
             .rewriteManifests()
             .addManifest(
                 writeManifest(
-                    "new_delete_manifest.avro",
+                    manifestFormat().addExtension("new_delete_manifest"),
                     // Specify data sequence number so that the delete files don't get aged out
                     // first
                     manifestEntry(
@@ -829,7 +841,7 @@ public class TestTransaction extends TestBase {
   @TestTemplate
   public void testOverwriteWithConcurrentManifestRewrite() throws IOException {
     assumeThat(formatVersion).isGreaterThanOrEqualTo(2);
-    String branch = "main";
+    String branch = SnapshotRef.MAIN_BRANCH;
     OverwriteFiles overwrite = table.newOverwrite().addFile(FILE_A).addFile(FILE_A2);
     Snapshot first = commit(table, overwrite, branch);
 
@@ -868,7 +880,7 @@ public class TestTransaction extends TestBase {
             .rewriteManifests()
             .addManifest(
                 writeManifest(
-                    "new_manifest.avro",
+                    manifestFormat().addExtension("new_manifest"),
                     manifestEntry(Status.EXISTING, first.snapshotId(), FILE_A),
                     manifestEntry(Status.EXISTING, first.snapshotId(), FILE_A2),
                     manifestEntry(Status.EXISTING, second.snapshotId(), FILE_B)))
@@ -917,8 +929,12 @@ public class TestTransaction extends TestBase {
     txn.commitTransaction();
     assertThat(version()).isEqualTo(2);
 
-    assertThat(readMetadata().refs()).hasSize(2).containsKey("main").containsKey("branch");
-    assertThat(readMetadata().ref("main").snapshotId()).isEqualTo(mainSnapshot.snapshotId());
+    assertThat(readMetadata().refs())
+        .hasSize(2)
+        .containsKey(SnapshotRef.MAIN_BRANCH)
+        .containsKey("branch");
+    assertThat(readMetadata().ref(SnapshotRef.MAIN_BRANCH).snapshotId())
+        .isEqualTo(mainSnapshot.snapshotId());
     assertThat(readMetadata().snapshot(mainSnapshot.snapshotId()).allManifests(table.io()))
         .hasSize(1);
     assertThat(readMetadata().ref("branch").snapshotId()).isEqualTo(branchSnapshot.snapshotId());

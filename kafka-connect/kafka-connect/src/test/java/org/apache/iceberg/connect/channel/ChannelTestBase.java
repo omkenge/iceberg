@@ -23,6 +23,7 @@ import static org.apache.iceberg.types.Types.NestedField.required;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyCollection;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.when;
 
 import java.io.IOException;
@@ -92,7 +93,7 @@ public class ChannelTestBase {
   @BeforeEach
   @SuppressWarnings("deprecation")
   public void before() {
-    catalog = initInMemoryCatalog();
+    catalog = spy(initInMemoryCatalog());
     catalog.createNamespace(NAMESPACE);
     table = catalog.createTable(TABLE_IDENTIFIER, SCHEMA);
 
@@ -101,6 +102,7 @@ public class ChannelTestBase {
     when(config.commitThreads()).thenReturn(1);
     when(config.connectGroupId()).thenReturn(CONNECT_CONSUMER_GROUP_ID);
     when(config.tableConfig(any())).thenReturn(mock(TableSinkConfig.class));
+    when(config.commitMaxConsecutiveFailures()).thenReturn(1);
 
     TopicPartitionInfo partitionInfo = mock(TopicPartitionInfo.class);
     when(partitionInfo.partition()).thenReturn(0);

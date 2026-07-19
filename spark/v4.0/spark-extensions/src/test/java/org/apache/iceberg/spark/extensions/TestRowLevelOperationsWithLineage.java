@@ -45,7 +45,7 @@ import org.apache.iceberg.SnapshotRef;
 import org.apache.iceberg.StructLike;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TestHelpers;
-import org.apache.iceberg.data.GenericAppenderFactory;
+import org.apache.iceberg.data.GenericFileWriterFactory;
 import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.encryption.EncryptionUtil;
@@ -95,6 +95,18 @@ public abstract class TestRowLevelOperationsWithLineage extends SparkRowLevelOpe
               + " fanout = {6}, branch = {7}, planningMode = {8}, formatVersion = {9}")
   public static Object[][] parameters() {
     return new Object[][] {
+      {
+        "testhadoop",
+        SparkCatalog.class.getName(),
+        ImmutableMap.of("type", "hadoop"),
+        FileFormat.ORC,
+        false,
+        WRITE_DISTRIBUTION_MODE_HASH,
+        true,
+        null,
+        LOCAL,
+        3
+      },
       {
         "testhadoop",
         SparkCatalog.class.getName(),
@@ -579,9 +591,14 @@ public abstract class TestRowLevelOperationsWithLineage extends SparkRowLevelOpe
     for (Map.Entry<Pair<Integer, StructLike>, List<Record>> entry : partitionedRecords.entrySet()) {
       OutputFile file = Files.localOutput(temp.resolve(UUID.randomUUID().toString()).toFile());
       DataWriter<Record> writer =
-          new GenericAppenderFactory(schemaWithRowLineage(table.schema()), table.spec())
+          new GenericFileWriterFactory.Builder(table)
+              .dataSchema(schemaWithRowLineage(table.schema()))
+              .dataFileFormat(fileFormat)
+              .build()
               .newDataWriter(
-                  EncryptionUtil.plainAsEncryptedOutput(file), fileFormat, entry.getKey().second());
+                  EncryptionUtil.plainAsEncryptedOutput(file),
+                  table.spec(),
+                  entry.getKey().second());
       List<Record> recordsForPartition = entry.getValue();
       writer.write(recordsForPartition);
       writer.close();

@@ -31,6 +31,7 @@ import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.iceberg.encryption.EncryptedKey;
+import org.apache.iceberg.encryption.EncryptionUtil;
 import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.relocated.com.google.common.base.MoreObjects;
 import org.apache.iceberg.relocated.com.google.common.base.Objects;
@@ -56,6 +57,8 @@ public class TableMetadata implements Serializable {
   static final int DEFAULT_TABLE_FORMAT_VERSION = 2;
   static final int SUPPORTED_TABLE_FORMAT_VERSION = 4;
   static final int MIN_FORMAT_VERSION_ROW_LINEAGE = 3;
+  static final int MIN_FORMAT_VERSION_PARQUET_MANIFESTS = 4;
+  static final int MIN_FORMAT_VERSION_OPTIONAL_LOCATION = 4;
   static final int INITIAL_SPEC_ID = 0;
   static final int INITIAL_SORT_ORDER_ID = 1;
   static final int INITIAL_SCHEMA_ID = 0;
@@ -136,9 +139,11 @@ public class TableMetadata implements Serializable {
 
     // Validate the metrics configuration. Note: we only do this on new tables to we don't
     // break existing tables.
-    MetricsConfig.fromProperties(properties).validateReferencedColumns(schema);
+    MetricsConfig.validate(properties, schema);
 
     PropertyUtil.validateCommitProperties(properties);
+
+    EncryptionUtil.checkCompatibility(properties, formatVersion);
 
     return new Builder()
         .setInitialFormatVersion(formatVersion)
@@ -308,6 +313,16 @@ public class TableMetadata implements Serializable {
         SUPPORTED_TABLE_FORMAT_VERSION);
     Preconditions.checkArgument(
         formatVersion == 1 || uuid != null, "UUID is required in format v%s", formatVersion);
+    boolean locationOptional = formatVersion >= MIN_FORMAT_VERSION_OPTIONAL_LOCATION;
+    Preconditions.checkArgument(
+        locationOptional || location != null,
+        "Table location is required in format v%s",
+        formatVersion);
+    Preconditions.checkArgument(
+        !locationOptional || location == null || LocationUtil.hasScheme(location),
+        "Invalid table location in format v%s, must be absolute: %s",
+        formatVersion,
+        location);
     Preconditions.checkArgument(
         formatVersion > 1 || lastSequenceNumber == 0,
         "Sequence number must be 0 in v1: %s",
@@ -1247,7 +1262,7 @@ public class TableMetadata implements Serializable {
           "Snapshot already exists for id: %s",
           snapshot.snapshotId());
 
-      ValidationException.check(
+      RetryableValidationException.check(
           formatVersion == 1
               || snapshot.sequenceNumber() > lastSequenceNumber
               || snapshot.parentId() == null,
@@ -1255,7 +1270,6 @@ public class TableMetadata implements Serializable {
           snapshot.sequenceNumber(),
           lastSequenceNumber);
 
-      this.lastUpdatedMillis = snapshot.timestampMillis();
       this.lastSequenceNumber = snapshot.sequenceNumber();
       snapshots.add(snapshot);
       snapshotsById.put(snapshot.snapshotId(), snapshot);
@@ -1264,7 +1278,7 @@ public class TableMetadata implements Serializable {
       if (formatVersion >= MIN_FORMAT_VERSION_ROW_LINEAGE) {
         ValidationException.check(
             snapshot.firstRowId() != null, "Cannot add a snapshot: first-row-id is null");
-        ValidationException.check(
+        RetryableValidationException.check(
             snapshot.firstRowId() != null && snapshot.firstRowId() >= nextRowId,
             "Cannot add a snapshot, first-row-id is behind table next-row-id: %s < %s",
             snapshot.firstRowId(),
@@ -1313,9 +1327,10 @@ public class TableMetadata implements Serializable {
       Snapshot snapshot = snapshotsById.get(snapshotId);
       ValidationException.check(
           snapshot != null, "Cannot set %s to unknown snapshot: %s", name, snapshotId);
-      if (isAddedSnapshot(snapshotId)) {
-        this.lastUpdatedMillis = snapshot.timestampMillis();
-      }
+      ValidationException.check(
+          !SnapshotRef.MAIN_BRANCH.equals(name) || ref.isBranch(),
+          "Cannot set %s to a tag, it must be a branch",
+          SnapshotRef.MAIN_BRANCH);
 
       if (SnapshotRef.MAIN_BRANCH.equals(name)) {
         this.currentSnapshotId = ref.snapshotId();
@@ -1323,7 +1338,10 @@ public class TableMetadata implements Serializable {
           this.lastUpdatedMillis = System.currentTimeMillis();
         }
 
-        snapshotLog.add(new SnapshotLogEntry(lastUpdatedMillis, ref.snapshotId()));
+        // rollback to an existing snapshot will use current timestamp as the time of the change
+        long timeOfChange =
+            isAddedSnapshot(snapshotId) ? snapshot.timestampMillis() : this.lastUpdatedMillis;
+        snapshotLog.add(new SnapshotLogEntry(timeOfChange, ref.snapshotId()));
       }
 
       refs.put(name, ref);
@@ -1501,10 +1519,10 @@ public class TableMetadata implements Serializable {
     }
 
     public Builder removeEncryptionKey(String keyId) {
-      boolean removed = encryptionKeys.removeIf(key -> key.keyId().equals(keyId));
-      keysById.remove(keyId);
+      EncryptedKey removedKey = keysById.remove(keyId);
 
-      if (removed) {
+      if (removedKey != null) {
+        encryptionKeys.remove(removedKey);
         changes.add(new MetadataUpdate.RemoveEncryptionKey(keyId));
       }
 

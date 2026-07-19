@@ -27,13 +27,17 @@ import java.nio.ByteOrder;
 import java.util.Map;
 import java.util.Random;
 import java.util.Set;
+import org.apache.iceberg.TestHelpers.RoundTripSerializer;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
+import org.apache.iceberg.types.Conversions;
+import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.DateTimeUtil;
 import org.apache.iceberg.util.RandomUtil;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 public class TestShreddedObject {
@@ -58,6 +62,26 @@ public class TestShreddedObject {
     assertThat(object.get("b").asPrimitive().get()).isEqualTo("iceberg");
     assertThat(object.get("c")).isInstanceOf(VariantPrimitive.class);
     assertThat(object.get("c").asPrimitive().get()).isEqualTo(new BigDecimal("12.21"));
+  }
+
+  @Test
+  public void testByteBufferConversion() {
+    Map<String, VariantValue> pathNormalizedFields =
+        ImmutableMap.of(
+            "$['a']",
+            Variants.of(34),
+            "$['b']",
+            Variants.of("iceberg"),
+            "$['c']",
+            Variants.of(new BigDecimal("12.21")));
+    ShreddedObject object = createShreddedObject(pathNormalizedFields);
+    VariantMetadata metadata = Variants.metadata("$['a']", "$['b']", "$['c']");
+    Variant expectedVariant = Variant.of(metadata, object);
+    ByteBuffer convertedValue = Conversions.toByteBuffer(Types.VariantType.get(), expectedVariant);
+    Variant readValue = Conversions.fromByteBuffer(Types.VariantType.get(), convertedValue);
+
+    VariantTestUtil.assertEqual(expectedVariant.metadata(), readValue.metadata());
+    VariantTestUtil.assertEqual(expectedVariant.value(), readValue.value());
   }
 
   @Test
@@ -192,6 +216,28 @@ public class TestShreddedObject {
   }
 
   @Test
+  public void testPartiallyShreddedUnserializedObjectSerializationMinimalBuffer() {
+    ShreddedObject partial = createUnserializedObject(FIELDS);
+    VariantMetadata metadata = partial.metadata();
+
+    // replace field c with a new value
+    partial.put("c", Variants.ofIsoDate("2024-10-12"));
+    partial.remove("b");
+
+    VariantValue value = roundTripMinimalBuffer(partial, metadata);
+
+    assertThat(value).isInstanceOf(SerializedObject.class);
+    SerializedObject actual = (SerializedObject) value;
+
+    assertThat(actual.get("a")).isInstanceOf(VariantPrimitive.class);
+    assertThat(actual.get("a").asPrimitive().get()).isEqualTo(34);
+    assertThat(actual.get("c")).isInstanceOf(VariantPrimitive.class);
+    assertThat(actual.get("c").type()).isEqualTo(PhysicalType.DATE);
+    assertThat(actual.get("c").asPrimitive().get())
+        .isEqualTo(DateTimeUtil.isoDateToDays("2024-10-12"));
+  }
+
+  @Test
   public void testPartiallyShreddedObjectSerializationLargeBuffer() {
     ShreddedObject partial = createUnshreddedObject(FIELDS);
     VariantMetadata metadata = partial.metadata();
@@ -211,6 +257,51 @@ public class TestShreddedObject {
     assertThat(actual.get("c").type()).isEqualTo(PhysicalType.DATE);
     assertThat(actual.get("c").asPrimitive().get())
         .isEqualTo(DateTimeUtil.isoDateToDays("2024-10-12"));
+  }
+
+  @Test
+  public void testRemoveInvalidatesSerializationState() {
+    ShreddedObject object = createShreddedObject(FIELDS);
+    VariantMetadata metadata = object.metadata();
+
+    // warm the serialization cache
+    VariantValue first = roundTripMinimalBuffer(object, metadata);
+    assertThat(first).isInstanceOf(SerializedObject.class);
+    assertThat(((SerializedObject) first).numFields()).isEqualTo(3);
+
+    // remove a field after caching
+    object.remove("b");
+    assertThat(object.get("b")).as("removed field should be hidden from reads").isNull();
+    assertThat(object.numFields()).as("numFields should reflect removal").isEqualTo(2);
+
+    // re-serialize: should not include the removed field
+    VariantValue second = roundTripMinimalBuffer(object, metadata);
+    assertThat(second).isInstanceOf(SerializedObject.class);
+    SerializedObject actual = (SerializedObject) second;
+    assertThat(actual.numFields()).isEqualTo(2);
+    assertThat(actual.get("b")).as("removed field must not be serialized").isNull();
+  }
+
+  @Test
+  public void testPutAfterRemoveClearsRemoveMarker() {
+    ShreddedObject object = createShreddedObject(FIELDS);
+    VariantMetadata metadata = object.metadata();
+
+    object.remove("b");
+    assertThat(object.get("b")).as("removed field should be hidden from reads").isNull();
+
+    object.put("b", Variants.of("rewritten"));
+    assertThat(object.get("b")).as("put after remove should restore the field").isNotNull();
+    assertThat(object.get("b").asPrimitive().get()).isEqualTo("rewritten");
+    assertThat(object.numFields()).as("numFields should include the re-added field").isEqualTo(3);
+    assertThat(object.fieldNames()).contains("b");
+
+    // the query API and the serialized bytes must agree on which fields are present
+    VariantValue serialized = roundTripMinimalBuffer(object, metadata);
+    assertThat(serialized).isInstanceOf(SerializedObject.class);
+    SerializedObject actual = (SerializedObject) serialized;
+    assertThat(actual.numFields()).isEqualTo(3);
+    VariantTestUtil.assertVariantString(actual.get("b"), "rewritten");
   }
 
   @ParameterizedTest
@@ -359,6 +450,12 @@ public class TestShreddedObject {
     return object;
   }
 
+  private static ShreddedObject createUnserializedObject(Map<String, VariantValue> fields) {
+    ByteBuffer metadataBuffer = VariantTestUtil.createMetadata(fields.keySet(), false);
+    VariantMetadata metadata = SerializedMetadata.from(metadataBuffer);
+    return new ShreddedObject(metadata, createShreddedObject(metadata, fields));
+  }
+
   /** Creates a ShreddedObject with fields in its shredded map */
   private static ShreddedObject createShreddedObject(Map<String, VariantValue> fields) {
     ByteBuffer metadataBuffer = VariantTestUtil.createMetadata(fields.keySet(), false);
@@ -378,5 +475,13 @@ public class TestShreddedObject {
         Variants.value(
             Variants.metadata(metadataBuffer),
             VariantTestUtil.createObject(metadataBuffer, fields));
+  }
+
+  @ParameterizedTest
+  @MethodSource("org.apache.iceberg.TestHelpers#serializers")
+  public void testSerialization(RoundTripSerializer<ShreddedObject> serializer) throws Exception {
+    ShreddedObject object = createShreddedObject(FIELDS);
+
+    VariantTestUtil.assertEqual(object, serializer.apply(object));
   }
 }

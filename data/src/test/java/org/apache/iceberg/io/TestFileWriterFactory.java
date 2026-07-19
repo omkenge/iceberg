@@ -22,6 +22,7 @@ import static org.apache.iceberg.MetadataColumns.DELETE_FILE_PATH;
 import static org.apache.iceberg.MetadataColumns.DELETE_FILE_POS;
 import static org.apache.iceberg.MetadataColumns.DELETE_FILE_ROW_FIELD_NAME;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatNoException;
 import static org.assertj.core.api.Assumptions.assumeThat;
 
 import java.io.File;
@@ -52,11 +53,12 @@ import org.apache.iceberg.orc.ORC;
 import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
-import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.CharSequenceSet;
 import org.apache.iceberg.util.Pair;
+import org.apache.iceberg.util.SerializationUtil;
 import org.apache.iceberg.util.StructLikeSet;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestTemplate;
 import org.junit.jupiter.api.extension.ExtendWith;
 
@@ -298,23 +300,17 @@ public abstract class TestFileWriterFactory<T> extends WriterTestBase<T> {
     } else {
       assertThat(referencedDataFiles).hasSize(1);
       assertThat(deleteFile.lowerBounds())
-          .hasSize(4)
+          .hasSize(2)
           .containsKey(DELETE_FILE_PATH.fieldId())
           .containsKey(DELETE_FILE_POS.fieldId());
-      for (Types.NestedField column : table.schema().columns()) {
-        assertThat(deleteFile.lowerBounds()).containsKey(column.fieldId());
-      }
       assertThat(deleteFile.upperBounds())
-          .hasSize(4)
+          .hasSize(2)
           .containsKey(DELETE_FILE_PATH.fieldId())
           .containsKey(DELETE_FILE_POS.fieldId());
-      for (Types.NestedField column : table.schema().columns()) {
-        assertThat(deleteFile.upperBounds()).containsKey(column.fieldId());
-      }
       // ORC also contains metrics for the deleted row struct, not just actual data fields
-      assertThat(deleteFile.columnSizes()).hasSizeGreaterThanOrEqualTo(4);
-      assertThat(deleteFile.valueCounts()).hasSizeGreaterThanOrEqualTo(2);
-      assertThat(deleteFile.nullValueCounts()).hasSizeGreaterThanOrEqualTo(2);
+      assertThat(deleteFile.columnSizes()).hasSizeGreaterThanOrEqualTo(2);
+      assertThat(deleteFile.valueCounts()).isNull();
+      assertThat(deleteFile.nullValueCounts()).isNull();
       assertThat(deleteFile.nanValueCounts()).isNull();
     }
 
@@ -404,6 +400,15 @@ public abstract class TestFileWriterFactory<T> extends WriterTestBase<T> {
             toRow(3, "aaa"),
             toRow(4, "aaa"));
     assertThat(actualRowSet("*")).isEqualTo(toSet(expectedRows));
+  }
+
+  @Test
+  void testSerialization() {
+    FileWriterFactory<T> writerFactory = newWriterFactory(table.schema());
+    assertThatNoException().isThrownBy(() -> SerializationUtil.serializeToBytes(writerFactory));
+
+    byte[] serialized = SerializationUtil.serializeToBytes(writerFactory);
+    assertThatNoException().isThrownBy(() -> SerializationUtil.deserializeFromBytes(serialized));
   }
 
   private DataFile writeData(

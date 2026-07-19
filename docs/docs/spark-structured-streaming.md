@@ -63,6 +63,13 @@ val df = spark.readStream
 !!! info
     Note: In addition to limiting micro-batch sizes on queries that use the default trigger (i.e. `Trigger.ProcessingTime`), rate limiting options can be applied to queries that use `Trigger.AvailableNow` to split one-time processing of all available source data into multiple micro-batches for better query scalability. Rate limiting options will be ignored when using the deprecated `Trigger.Once` trigger.
 
+### Asynchronous Micro-Batch Planning
+
+Users can enable asynchronous micro-batch planning by setting `async-micro-batch-planning-enabled` to true. With this option enabled, Iceberg will start processing the current micro-batch while planning the next micro-batches in parallel.
+This can help improve query throughput by reducing idle time between micro-batches. Users should weigh the tradeoffs, which include higher memory usage and increased snapshot detection latency.
+
+Users can also set additional options to control the behavior of asynchronous micro-batch planning, found in the [spark configuration](spark-configuration.md#read-options).
+
 ## Streaming Writes
 
 To write values from streaming query to Iceberg table, use `DataStreamWriter`:
@@ -75,8 +82,6 @@ data.writeStream
     .option("checkpointLocation", checkpointPath)
     .toTable("database.table_name")
 ```
-
-If you're using Spark 3.0 or earlier, you need to use `.option("path", "database.table_name").start()`, instead of `.toTable("database.table_name")`.
 
 In the case of the directory-based Hadoop catalog:
 
@@ -101,7 +106,7 @@ Iceberg doesn't support experimental [continuous processing](https://spark.apach
 
 ### Partitioned table
 
-Iceberg requires sorting data by partition per task prior to writing the data. In Spark tasks are split by Spark partition.
+Iceberg requires sorting data by partition per task prior to writing the data. In Spark tasks are split by Spark partition
 against partitioned table. For batch queries you're encouraged to do explicit sort to fulfill the requirement
 (see [here](spark-writes.md#writing-distribution-modes)), but the approach would bring additional latency as
 repartition and sort are considered as heavy operations for streaming workload. To avoid additional latency, you can
@@ -134,7 +139,7 @@ documents how to configure the interval.
 
 ### Expire old snapshots
 
-Each batch written to a table produces a new snapshot. Iceberg tracks snapshots in table metadata until they are expired. Snapshots accumulate quickly with frequent commits, so it is highly recommended that tables written by streaming queries are [regularly maintained](maintenance.md#expire-snapshots). [Snapshot expiration](spark-procedures.md#expire_snapshots) is the procedure of removing the metadata and any data files that are no longer needed. By default, the procedure will expire the snapshots older than five days. 
+Each batch written to a table produces a new snapshot. Iceberg tracks snapshots in table metadata until they are expired. Snapshots accumulate quickly with frequent commits, so it is highly recommended that tables written by streaming queries are [regularly maintained](maintenance.md#expire-snapshots). [Snapshot expiration](spark-procedures.md#expire_snapshots) is the procedure of removing the metadata and any data files that are no longer needed. By default, the procedure will expire the snapshots older than five days.
 
 ### Compacting data files
 

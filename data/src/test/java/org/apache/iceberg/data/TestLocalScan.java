@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.data;
 
+import static org.apache.iceberg.data.FileHelpers.encrypt;
 import static org.apache.iceberg.expressions.Expressions.equal;
 import static org.apache.iceberg.expressions.Expressions.lessThan;
 import static org.apache.iceberg.expressions.Expressions.lessThanOrEqual;
@@ -57,7 +58,10 @@ import org.apache.iceberg.Tables;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.hadoop.HadoopInputFile;
 import org.apache.iceberg.hadoop.HadoopTables;
-import org.apache.iceberg.io.FileAppender;
+import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.io.DataWriter;
+import org.apache.iceberg.metrics.InMemoryMetricsReporter;
+import org.apache.iceberg.metrics.ScanReport;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
@@ -286,6 +290,22 @@ public class TestLocalScan {
     Set<Record> records = Sets.newHashSet(results);
     assertThat(records).as("Should produce correct number of records").hasSameSizeAs(expected);
     assertThat(records).as("Random record set should match").isEqualTo(expected);
+  }
+
+  @TestTemplate
+  public void testScanMetricsReporter() throws IOException {
+    InMemoryMetricsReporter reporter = new InMemoryMetricsReporter();
+
+    try (CloseableIterable<Record> results =
+        IcebergGenerics.read(sharedTable).metricsReporter(reporter).build()) {
+      assertThat(Sets.newHashSet(results)).hasSize(9);
+    }
+
+    ScanReport scanReport = reporter.scanReport();
+    assertThat(scanReport).isNotNull();
+    assertThat(scanReport.tableName()).isEqualTo(sharedTable.name());
+    assertThat(scanReport.snapshotId()).isEqualTo(sharedTable.currentSnapshot().snapshotId());
+    assertThat(scanReport.scanMetrics().resultDataFiles().value()).isEqualTo(3);
   }
 
   @TestTemplate
@@ -528,16 +548,17 @@ public class TestLocalScan {
     FileFormat fileFormat = FileFormat.fromFileName(filename);
     Preconditions.checkNotNull(fileFormat, "Cannot determine format for file: %s", filename);
 
-    FileAppender<Record> fileAppender =
-        new GenericAppenderFactory(schema).newAppender(fromPath(path, CONF), fileFormat);
-    try (FileAppender<Record> appender = fileAppender) {
-      appender.addAll(records);
+    DataWriter<Record> writer =
+        new GenericFileWriterFactory.Builder()
+            .dataSchema(schema)
+            .dataFileFormat(fileFormat)
+            .build()
+            .newDataWriter(encrypt(fromPath(path, CONF)), PartitionSpec.unpartitioned(), null);
+    try (writer) {
+      writer.write(records);
     }
 
-    return DataFiles.builder(PartitionSpec.unpartitioned())
-        .withInputFile(HadoopInputFile.fromPath(path, CONF))
-        .withMetrics(fileAppender.metrics())
-        .build();
+    return writer.toDataFile();
   }
 
   @TestTemplate

@@ -22,6 +22,7 @@ import static org.apache.iceberg.spark.actions.RewriteTablePathSparkAction.NOT_A
 import static org.apache.iceberg.types.Types.NestedField.optional;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assumptions.assumeThat;
 
 import java.io.File;
 import java.io.IOException;
@@ -29,6 +30,9 @@ import java.net.URI;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -38,11 +42,21 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.BaseTable;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
+import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.HasTableOperations;
+import org.apache.iceberg.ManifestFile;
+import org.apache.iceberg.ManifestFiles;
+import org.apache.iceberg.ManifestReader;
+import org.apache.iceberg.Parameter;
+import org.apache.iceberg.ParameterizedTestExtension;
+import org.apache.iceberg.Parameters;
 import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.RowDelta;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Snapshot;
+import org.apache.iceberg.SnapshotChanges;
 import org.apache.iceberg.StaticTableOperations;
+import org.apache.iceberg.StructLike;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableProperties;
@@ -55,13 +69,18 @@ import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.data.FileHelpers;
 import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.data.Record;
+import org.apache.iceberg.deletes.BaseDVFileWriter;
+import org.apache.iceberg.deletes.DVFileWriter;
 import org.apache.iceberg.deletes.PositionDelete;
 import org.apache.iceberg.hadoop.HadoopTables;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.OutputFile;
+import org.apache.iceberg.io.OutputFileFactory;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.spark.SparkCatalog;
 import org.apache.iceberg.spark.TestBase;
 import org.apache.iceberg.spark.source.ThreeColumnRecord;
@@ -80,16 +99,25 @@ import org.apache.spark.storage.BlockManager;
 import org.apache.spark.storage.BroadcastBlockId;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestTemplate;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.io.TempDir;
 import scala.Tuple2;
 
+@ExtendWith(ParameterizedTestExtension.class)
 public class TestRewriteTablePathsAction extends TestBase {
 
   @TempDir private Path staging;
   @TempDir private Path tableDir;
   @TempDir private Path newTableDir;
   @TempDir private Path targetTableDir;
+
+  @Parameters(name = "formatVersion = {0}")
+  protected static List<Integer> formatVersions() {
+    return TestHelpers.V2_AND_ABOVE;
+  }
+
+  @Parameter private int formatVersion;
 
   protected ActionsProvider actions() {
     return SparkActions.get();
@@ -135,7 +163,15 @@ public class TestRewriteTablePathsAction extends TestBase {
 
   private Table createTableWithSnapshots(
       String location, int snapshotNumber, Map<String, String> properties, String mode) {
-    Table newTable = TABLES.create(SCHEMA, PartitionSpec.unpartitioned(), properties, location);
+    Table newTable =
+        TABLES.create(
+            SCHEMA,
+            PartitionSpec.unpartitioned(),
+            ImmutableMap.<String, String>builder()
+                .put(TableProperties.FORMAT_VERSION, String.valueOf(formatVersion))
+                .putAll(properties)
+                .build(),
+            location);
 
     List<ThreeColumnRecord> records =
         Lists.newArrayList(new ThreeColumnRecord(1, "AAAAAAAAAA", "AAAA"));
@@ -159,7 +195,7 @@ public class TestRewriteTablePathsAction extends TestBase {
     sql("DROP DATABASE IF EXISTS %s CASCADE", backupNs);
   }
 
-  @Test
+  @TestTemplate
   public void testRewritePath() throws Exception {
     String targetTableLocation = targetTableLocation();
 
@@ -207,7 +243,7 @@ public class TestRewriteTablePathsAction extends TestBase {
     assertEquals("Rows should match after copy", expected, actual);
   }
 
-  @Test
+  @TestTemplate
   public void testSameLocations() {
     assertThatThrownBy(
             () ->
@@ -220,7 +256,7 @@ public class TestRewriteTablePathsAction extends TestBase {
         .hasMessageContaining("Source prefix cannot be the same as target prefix");
   }
 
-  @Test
+  @TestTemplate
   public void testStartVersion() throws Exception {
     RewriteTablePath.Result result =
         actions()
@@ -244,7 +280,7 @@ public class TestRewriteTablePathsAction extends TestBase {
         .isEmpty();
   }
 
-  @Test
+  @TestTemplate
   public void testIncrementalRewrite() throws Exception {
     String location = newTableLocation();
     Table sourceTable =
@@ -291,7 +327,7 @@ public class TestRewriteTablePathsAction extends TestBase {
     assertEquals("Rows should match after copy", expected, actual);
   }
 
-  @Test
+  @TestTemplate
   public void testTableWith3Snapshots(@TempDir Path location1, @TempDir Path location2)
       throws Exception {
     String location = newTableLocation();
@@ -316,7 +352,7 @@ public class TestRewriteTablePathsAction extends TestBase {
     checkFileNum(3, 3, 3, 12, result1);
   }
 
-  @Test
+  @TestTemplate
   public void testFullTableRewritePath() throws Exception {
     RewriteTablePath.Result result =
         actions()
@@ -327,7 +363,7 @@ public class TestRewriteTablePathsAction extends TestBase {
     checkFileNum(3, 2, 2, 9, result);
   }
 
-  @Test
+  @TestTemplate
   public void testManifestRewriteAndIncrementalCopy() throws Exception {
     RewriteTablePath.Result initialResult =
         actions()
@@ -354,7 +390,7 @@ public class TestRewriteTablePathsAction extends TestBase {
     checkFileNum(1, 1, addedManifest, 3, postReweiteResult);
   }
 
-  @Test
+  @TestTemplate
   public void testDeleteDataFile() throws Exception {
     List<String> validDataFiles =
         spark
@@ -386,29 +422,61 @@ public class TestRewriteTablePathsAction extends TestBase {
         .hasSize(1);
   }
 
-  @Test
-  public void testPositionDeletes() throws Exception {
+  @TestTemplate
+  public void testPositionDeletesParquet() throws Exception {
+    runPositionDeletesTest("parquet");
+  }
+
+  @TestTemplate
+  public void testPositionDeletesAvro() throws Exception {
+    runPositionDeletesTest("avro");
+  }
+
+  @TestTemplate
+  public void testPositionDeletesOrc() throws Exception {
+    runPositionDeletesTest("orc");
+  }
+
+  private void runPositionDeletesTest(String fileFormat) throws Exception {
+    Table tableWithPosDeletes =
+        createTableWithSnapshots(
+            tableDir.toFile().toURI().toString().concat("tableWithPosDeletes").concat(fileFormat),
+            2,
+            Map.of(TableProperties.DELETE_DEFAULT_FILE_FORMAT, fileFormat));
+
     List<Pair<CharSequence, Long>> deletes =
         Lists.newArrayList(
             Pair.of(
-                table.currentSnapshot().addedDataFiles(table.io()).iterator().next().location(),
+                SnapshotChanges.builderFor(tableWithPosDeletes)
+                    .build()
+                    .addedDataFiles()
+                    .iterator()
+                    .next()
+                    .location(),
                 0L));
 
-    File file = new File(removePrefix(table.location() + "/data/deeply/nested/deletes.parquet"));
+    File file =
+        new File(
+            removePrefix(
+                tableWithPosDeletes.location() + "/data/deeply/nested/deletes." + fileFormat));
     DeleteFile positionDeletes =
         FileHelpers.writeDeleteFile(
-                table, table.io().newOutputFile(file.toURI().toString()), deletes)
+                tableWithPosDeletes,
+                tableWithPosDeletes.io().newOutputFile(file.toURI().toString()),
+                deletes,
+                formatVersion)
             .first();
 
-    table.newRowDelta().addDeletes(positionDeletes).commit();
+    tableWithPosDeletes.newRowDelta().addDeletes(positionDeletes).commit();
 
-    assertThat(spark.read().format("iceberg").load(table.location()).collectAsList()).hasSize(1);
+    assertThat(spark.read().format("iceberg").load(tableWithPosDeletes.location()).collectAsList())
+        .hasSize(1);
 
     RewriteTablePath.Result result =
         actions()
-            .rewriteTablePath(table)
+            .rewriteTablePath(tableWithPosDeletes)
             .stagingLocation(stagingLocation())
-            .rewriteLocationPrefix(table.location(), targetTableLocation())
+            .rewriteLocationPrefix(tableWithPosDeletes.location(), targetTableLocation())
             .execute();
 
     // We have one more snapshot, an additional manifest list, and a new (delete) manifest,
@@ -423,10 +491,10 @@ public class TestRewriteTablePathsAction extends TestBase {
         .hasSize(1);
   }
 
-  @Test
+  @TestTemplate
   public void testPositionDeleteWithRow() throws Exception {
     String dataFileLocation =
-        table.currentSnapshot().addedDataFiles(table.io()).iterator().next().location();
+        SnapshotChanges.builderFor(table).build().addedDataFiles().iterator().next().location();
     List<PositionDelete<?>> deletes = Lists.newArrayList();
     OutputFile deleteFile =
         table
@@ -436,7 +504,8 @@ public class TestRewriteTablePathsAction extends TestBase {
                     .toURI()
                     .toString());
     deletes.add(positionDelete(SCHEMA, dataFileLocation, 0L, 1, "AAAAAAAAAA", "AAAA"));
-    DeleteFile positionDeletes = FileHelpers.writePosDeleteFile(table, deleteFile, null, deletes);
+    DeleteFile positionDeletes =
+        FileHelpers.writePosDeleteFile(table, deleteFile, null, deletes, formatVersion);
     table.newRowDelta().addDeletes(positionDeletes).commit();
 
     assertThat(spark.read().format("iceberg").load(table.location()).collectAsList()).hasSize(1);
@@ -455,21 +524,35 @@ public class TestRewriteTablePathsAction extends TestBase {
     // copy the metadata files and data files
     copyTableFiles(result);
 
-    // check copied position delete row
-    Object[] deletedRow = (Object[]) rows(targetTableLocation() + "#position_deletes").get(0)[2];
-    assertEquals(
-        "Position deletes should be equal", new Object[] {1, "AAAAAAAAAA", "AAAA"}, deletedRow);
+    // check copied position delete row - only v2 stores row data with position deletes
+    // v3+ uses Deletion Vectors (DV) which only store position information
+    if (formatVersion == 2) {
+      Object[] deletedRow = (Object[]) rows(targetTableLocation() + "#position_deletes").get(0)[2];
+      assertEquals(
+          "Position deletes should be equal", new Object[] {1, "AAAAAAAAAA", "AAAA"}, deletedRow);
+    }
 
     // Positional delete affects a single row, so only one row must remain
     assertThat(spark.read().format("iceberg").load(targetTableLocation()).collectAsList())
         .hasSize(1);
   }
 
-  @Test
+  @TestTemplate
   public void testPositionDeletesAcrossFiles() throws Exception {
+    assumeThat(formatVersion)
+        .as("Can't write multiple deletes into a single v3 delete file")
+        .isEqualTo(2);
     Stream<DataFile> allFiles =
         StreamSupport.stream(table.snapshots().spliterator(), false)
-            .flatMap(s -> StreamSupport.stream(s.addedDataFiles(table.io()).spliterator(), false));
+            .flatMap(
+                s ->
+                    StreamSupport.stream(
+                        SnapshotChanges.builderFor(table)
+                            .snapshot(s)
+                            .build()
+                            .addedDataFiles()
+                            .spliterator(),
+                        false));
     List<Pair<CharSequence, Long>> deletes =
         allFiles.map(f -> Pair.of((CharSequence) f.location(), 0L)).collect(Collectors.toList());
 
@@ -479,7 +562,7 @@ public class TestRewriteTablePathsAction extends TestBase {
     File file = new File(removePrefix(table.location() + "/data/deeply/nested/file.parquet"));
     DeleteFile positionDeletes =
         FileHelpers.writeDeleteFile(
-                table, table.io().newOutputFile(file.toURI().toString()), deletes)
+                table, table.io().newOutputFile(file.toURI().toString()), deletes, formatVersion)
             .first();
 
     table.newRowDelta().addDeletes(positionDeletes).commit();
@@ -504,7 +587,357 @@ public class TestRewriteTablePathsAction extends TestBase {
         .isEmpty();
   }
 
-  @Test
+  /**
+   * Test for https://github.com/apache/iceberg/issues/14814
+   *
+   * <p>This test verifies that rewrite_table_path correctly deduplicates delete files when the same
+   * delete file appears in multiple manifests. Without the DeleteFileSet fix, this test would fail
+   * with AlreadyExistsException because DeleteFile objects don't override equals() and the same
+   * file would be processed multiple times.
+   *
+   * <p>The test creates a scenario where the same delete file is added to multiple snapshots,
+   * causing it to appear in multiple manifest entries. When these manifests are processed, the same
+   * delete file is returned as different object instances which need proper deduplication.
+   */
+  @TestTemplate
+  public void testPositionDeletesDeduplication() throws Exception {
+    // Format versions 3 and 4 use Deletion Vectors stored in Puffin files, which have different
+    // validation rules that prevent adding the same delete file multiple times
+    assumeThat(formatVersion)
+        .as("Format versions 3+ use DVs with different validation rules")
+        .isEqualTo(2);
+
+    Table tableWithPosDeletes =
+        createTableWithSnapshots(
+            tableDir.toFile().toURI().toString().concat("tableWithDuplicateDeletes"),
+            2,
+            Map.of(TableProperties.DELETE_DEFAULT_FILE_FORMAT, "parquet"));
+
+    // Get a data file to create position deletes for
+    DataFile dataFile =
+        tableWithPosDeletes
+            .currentSnapshot()
+            .addedDataFiles(tableWithPosDeletes.io())
+            .iterator()
+            .next();
+
+    // Create a position delete file
+    List<Pair<CharSequence, Long>> deletes = Lists.newArrayList(Pair.of(dataFile.location(), 0L));
+    File deleteFile =
+        new File(
+            removePrefix(tableWithPosDeletes.location() + "/data/deeply/nested/deletes.parquet"));
+    DeleteFile positionDeletes =
+        FileHelpers.writeDeleteFile(
+                tableWithPosDeletes,
+                tableWithPosDeletes.io().newOutputFile(deleteFile.toURI().toString()),
+                deletes,
+                formatVersion)
+            .first();
+
+    tableWithPosDeletes.newRowDelta().addDeletes(positionDeletes).commit();
+
+    // Add the SAME delete file AGAIN in a second snapshot - this creates a duplicate entry
+    // in a new manifest, which will cause duplicate DeleteFile objects when processing
+    tableWithPosDeletes.newRowDelta().addDeletes(positionDeletes).commit();
+
+    // This should NOT throw AlreadyExistsException
+    RewriteTablePath.Result result =
+        actions()
+            .rewriteTablePath(tableWithPosDeletes)
+            .stagingLocation(stagingLocation())
+            .rewriteLocationPrefix(tableWithPosDeletes.location(), targetTableLocation())
+            .execute();
+
+    assertThat(result.rewrittenDeleteFilePathsCount())
+        .as("Should have rewritten exactly 1 delete file after deduplication")
+        .isEqualTo(1);
+  }
+
+  // Regression test: when the same position delete file is referenced from manifests in different
+  // snapshots, it must be rewritten once and the resulting size stamped consistently into every
+  // manifest that references it. The delete file is enumerated and deduped by path before the
+  // rewrite, so its measured size is shared across all referencing delete manifests.
+  @TestTemplate
+  public void testSharedDeleteFileSizeAcrossManifests() throws Exception {
+    assumeThat(formatVersion)
+        .as("Format versions 3+ use DVs with different validation rules")
+        .isEqualTo(2);
+
+    Table tableWithPosDeletes =
+        createTableWithSnapshots(
+            tableDir.toFile().toURI().toString().concat("tableWithSharedDelete"),
+            1,
+            Map.of(TableProperties.DELETE_DEFAULT_FILE_FORMAT, "parquet"));
+
+    DataFile dataFile =
+        tableWithPosDeletes
+            .currentSnapshot()
+            .addedDataFiles(tableWithPosDeletes.io())
+            .iterator()
+            .next();
+
+    List<Pair<CharSequence, Long>> deletes = Lists.newArrayList(Pair.of(dataFile.location(), 0L));
+    File deleteFile =
+        new File(
+            removePrefix(tableWithPosDeletes.location() + "/data/deeply/nested/deletes.parquet"));
+    DeleteFile positionDeletes =
+        FileHelpers.writeDeleteFile(
+                tableWithPosDeletes,
+                tableWithPosDeletes.io().newOutputFile(deleteFile.toURI().toString()),
+                deletes,
+                formatVersion)
+            .first();
+
+    tableWithPosDeletes.newRowDelta().addDeletes(positionDeletes).commit();
+    tableWithPosDeletes.newRowDelta().addDeletes(positionDeletes).commit();
+
+    RewriteTablePath.Result result =
+        actions()
+            .rewriteTablePath(tableWithPosDeletes)
+            .stagingLocation(stagingLocation())
+            .rewriteLocationPrefix(tableWithPosDeletes.location(), targetTableLocation())
+            .execute();
+    copyTableFiles(result);
+
+    Table targetTable = TABLES.load(targetTableLocation());
+    List<ManifestFile> deleteManifests =
+        targetTable.currentSnapshot().deleteManifests(targetTable.io());
+    assertThat(deleteManifests)
+        .as("Expected the shared delete file to be referenced by multiple manifests")
+        .hasSizeGreaterThanOrEqualTo(2);
+    for (ManifestFile manifest : deleteManifests) {
+      try (ManifestReader<DeleteFile> reader =
+          ManifestFiles.readDeleteManifest(manifest, targetTable.io(), targetTable.specs())) {
+        for (DeleteFile df : reader) {
+          long manifestSize = df.fileSizeInBytes();
+          long actualSize = targetTable.io().newInputFile(df.location()).getLength();
+          assertThat(manifestSize)
+              .as(
+                  "file_size_in_bytes in rewritten manifest should match actual file size for %s",
+                  df.location())
+              .isEqualTo(actualSize);
+        }
+      }
+    }
+  }
+
+  // Regression test: a single delete manifest can reference multiple distinct position delete
+  // files, and each entry must be stamped with its own rewritten size. The two delete files carry
+  // a different number of records so they rewrite to different sizes, which catches a per-path size
+  // map that collapses entries to a single size or falls back to the stale original size.
+  @TestTemplate
+  public void testMultipleDistinctDeleteFileSizesAfterRewrite() throws Exception {
+    assumeThat(formatVersion)
+        .as("Format versions 3+ use DVs with different validation rules")
+        .isEqualTo(2);
+
+    Table tableWithPosDeletes =
+        createTableWithSnapshots(
+            tableDir.toFile().toURI().toString().concat("tableWithDistinctDeletes"),
+            2,
+            Map.of(TableProperties.DELETE_DEFAULT_FILE_FORMAT, "parquet"));
+
+    List<DataFile> dataFiles = Lists.newArrayList();
+    tableWithPosDeletes
+        .snapshots()
+        .forEach(
+            snapshot -> snapshot.addedDataFiles(tableWithPosDeletes.io()).forEach(dataFiles::add));
+    assertThat(dataFiles).as("Expected two data files to reference from deletes").hasSize(2);
+
+    // One delete file holds a single record, the other holds two, so they rewrite to distinct
+    // on-disk sizes.
+    File smallDeleteFile =
+        new File(
+            removePrefix(
+                tableWithPosDeletes.location() + "/data/deeply/nested/deletes-small.parquet"));
+    DeleteFile smallDelete =
+        FileHelpers.writeDeleteFile(
+                tableWithPosDeletes,
+                tableWithPosDeletes.io().newOutputFile(smallDeleteFile.toURI().toString()),
+                Lists.newArrayList(Pair.of(dataFiles.get(0).location(), 0L)),
+                formatVersion)
+            .first();
+
+    File largeDeleteFile =
+        new File(
+            removePrefix(
+                tableWithPosDeletes.location() + "/data/deeply/nested/deletes-large.parquet"));
+    DeleteFile largeDelete =
+        FileHelpers.writeDeleteFile(
+                tableWithPosDeletes,
+                tableWithPosDeletes.io().newOutputFile(largeDeleteFile.toURI().toString()),
+                Lists.newArrayList(
+                    Pair.of(dataFiles.get(0).location(), 0L),
+                    Pair.of(dataFiles.get(1).location(), 0L)),
+                formatVersion)
+            .first();
+
+    tableWithPosDeletes.newRowDelta().addDeletes(smallDelete).addDeletes(largeDelete).commit();
+
+    RewriteTablePath.Result result =
+        actions()
+            .rewriteTablePath(tableWithPosDeletes)
+            .stagingLocation(stagingLocation())
+            .rewriteLocationPrefix(tableWithPosDeletes.location(), targetTableLocation())
+            .execute();
+    copyTableFiles(result);
+
+    Table targetTable = TABLES.load(targetTableLocation());
+    List<Long> rewrittenSizes = Lists.newArrayList();
+    for (ManifestFile manifest : targetTable.currentSnapshot().deleteManifests(targetTable.io())) {
+      try (ManifestReader<DeleteFile> reader =
+          ManifestFiles.readDeleteManifest(manifest, targetTable.io(), targetTable.specs())) {
+        for (DeleteFile df : reader) {
+          long manifestSize = df.fileSizeInBytes();
+          long actualSize = targetTable.io().newInputFile(df.location()).getLength();
+          assertThat(manifestSize)
+              .as(
+                  "file_size_in_bytes in rewritten manifest should match actual file size for %s",
+                  df.location())
+              .isEqualTo(actualSize);
+          rewrittenSizes.add(manifestSize);
+        }
+      }
+    }
+
+    assertThat(rewrittenSizes)
+        .as(
+            "The two distinct delete files should rewrite to distinct, independently recorded sizes")
+        .hasSize(2)
+        .doesNotHaveDuplicates();
+  }
+
+  // Regression test: rewriting delete file paths changes the file size (since the
+  // embedded data file paths may differ in length), but file_size_in_bytes in the rewritten
+  // manifest was not updated. Readers that use file_size_in_bytes to elide a stat() call may
+  // fail.
+  @TestTemplate
+  public void testDeleteFileSizeInBytesAfterRewrite() throws Exception {
+    List<Pair<CharSequence, Long>> deletes =
+        Lists.newArrayList(
+            Pair.of(
+                SnapshotChanges.builderFor(table)
+                    .build()
+                    .addedDataFiles()
+                    .iterator()
+                    .next()
+                    .location(),
+                0L));
+
+    File file = new File(removePrefix(table.location() + "/data/deeply/nested/deletes.parquet"));
+    DeleteFile positionDeletes =
+        FileHelpers.writeDeleteFile(
+                table, table.io().newOutputFile(file.toURI().toString()), deletes, formatVersion)
+            .first();
+    table.newRowDelta().addDeletes(positionDeletes).commit();
+
+    RewriteTablePath.Result result =
+        actions()
+            .rewriteTablePath(table)
+            .stagingLocation(stagingLocation())
+            .rewriteLocationPrefix(table.location(), targetTableLocation())
+            .execute();
+    copyTableFiles(result);
+
+    Table targetTable = TABLES.load(targetTableLocation());
+    for (ManifestFile manifest : targetTable.currentSnapshot().deleteManifests(targetTable.io())) {
+      try (ManifestReader<DeleteFile> reader =
+          ManifestFiles.readDeleteManifest(manifest, targetTable.io(), targetTable.specs())) {
+        for (DeleteFile df : reader) {
+          long manifestSize = df.fileSizeInBytes();
+          long actualSize = targetTable.io().newInputFile(df.location()).getLength();
+          assertThat(manifestSize)
+              .as(
+                  "file_size_in_bytes in rewritten manifest should match actual file size for %s",
+                  df.location())
+              .isEqualTo(actualSize);
+        }
+      }
+    }
+  }
+
+  // Regression test: a single Puffin file can hold multiple DVs (one blob per data file)
+  // referenced by distinct DeleteFile entries that share the same location. The rewrite must
+  // rewrite
+  // the physical Puffin file once (rather than colliding on the staging path) and stamp the
+  // rewritten size into every referencing manifest entry.
+  @TestTemplate
+  public void testSharedPuffinDeleteFileSizeAfterRewrite() throws Exception {
+    assumeThat(formatVersion)
+        .as("DVs are introduced in v3; v4 writes parquet manifests the test setup cannot read")
+        .isEqualTo(3);
+
+    Table tableWithDVs =
+        createTableWithSnapshots(
+            tableDir.toFile().toURI().toString().concat("tableWithSharedPuffin"), 2);
+
+    List<String> dataFilePaths = Lists.newArrayList();
+    tableWithDVs
+        .snapshots()
+        .forEach(
+            snapshot ->
+                snapshot
+                    .addedDataFiles(tableWithDVs.io())
+                    .forEach(dataFile -> dataFilePaths.add(dataFile.location())));
+    assertThat(dataFilePaths).as("Expected two data files to back two DVs").hasSize(2);
+
+    List<DeleteFile> dvs = writeDVsForDataFiles(tableWithDVs, dataFilePaths);
+    assertThat(dvs)
+        .as("Both DVs should live in a single Puffin file")
+        .hasSize(2)
+        .allSatisfy(dv -> assertThat(dv.location()).isEqualTo(dvs.get(0).location()));
+
+    RowDelta rowDelta = tableWithDVs.newRowDelta();
+    dvs.forEach(rowDelta::addDeletes);
+    rowDelta.commit();
+
+    RewriteTablePath.Result result =
+        actions()
+            .rewriteTablePath(tableWithDVs)
+            .stagingLocation(stagingLocation())
+            .rewriteLocationPrefix(tableWithDVs.location(), targetTableLocation())
+            .execute();
+    assertThat(result.rewrittenDeleteFilePathsCount())
+        .as("Two DVs are two delete files with rewritten paths")
+        .isEqualTo(2);
+    copyTableFiles(result);
+
+    Table targetTable = TABLES.load(targetTableLocation());
+    Set<String> rewrittenLocations = Sets.newHashSet();
+    for (ManifestFile manifest : targetTable.currentSnapshot().deleteManifests(targetTable.io())) {
+      try (ManifestReader<DeleteFile> reader =
+          ManifestFiles.readDeleteManifest(manifest, targetTable.io(), targetTable.specs())) {
+        for (DeleteFile df : reader) {
+          rewrittenLocations.add(df.location());
+          long actualSize = targetTable.io().newInputFile(df.location()).getLength();
+          assertThat(df.fileSizeInBytes())
+              .as("file_size_in_bytes should match the rewritten Puffin size for %s", df.location())
+              .isEqualTo(actualSize);
+        }
+      }
+    }
+    assertThat(rewrittenLocations)
+        .as("Both DVs should point at the single rewritten Puffin file")
+        .hasSize(1);
+  }
+
+  // Writes one DV per data file path into a single Puffin file, returning the resulting DeleteFiles
+  // (which share a location but carry distinct blob offsets).
+  private List<DeleteFile> writeDVsForDataFiles(Table targetTable, List<String> dataFilePaths)
+      throws IOException {
+    OutputFileFactory fileFactory =
+        OutputFileFactory.builderFor(targetTable, 1, 1).format(FileFormat.PUFFIN).build();
+    DVFileWriter writer = new BaseDVFileWriter(fileFactory, p -> null);
+    try (DVFileWriter closeableWriter = writer) {
+      for (String path : dataFilePaths) {
+        closeableWriter.delete(path, 0L, targetTable.spec(), (StructLike) null);
+      }
+    }
+
+    return writer.result().deleteFiles();
+  }
+
+  @TestTemplate
   public void testEqualityDeletes() throws Exception {
     Table sourceTable = createTableWithSnapshots(newTableLocation(), 1);
 
@@ -559,7 +992,7 @@ public class TestRewriteTablePathsAction extends TestBase {
         .hasSize(2);
   }
 
-  @Test
+  @TestTemplate
   public void testFullTableRewritePathWithDeletedVersionFiles() throws Exception {
     String location = newTableLocation();
     Table sourceTable = createTableWithSnapshots(location, 2);
@@ -605,7 +1038,7 @@ public class TestRewriteTablePathsAction extends TestBase {
         result);
   }
 
-  @Test
+  @TestTemplate
   public void testRewritePathWithoutSnapshot() throws Exception {
     RewriteTablePath.Result result =
         actions()
@@ -618,7 +1051,7 @@ public class TestRewriteTablePathsAction extends TestBase {
     checkFileNum(1, 0, 0, 1, result);
   }
 
-  @Test
+  @TestTemplate
   public void testExpireSnapshotBeforeRewrite() throws Exception {
     // expire one snapshot
     actions().expireSnapshots(table).expireSnapshotId(table.currentSnapshot().parentId()).execute();
@@ -633,7 +1066,7 @@ public class TestRewriteTablePathsAction extends TestBase {
     checkFileNum(4, 1, 2, 9, result);
   }
 
-  @Test
+  @TestTemplate
   public void testRewritePathWithNonLiveEntry() throws Exception {
     String location = newTableLocation();
     // first overwrite generate 1 manifest and 1 data file
@@ -643,7 +1076,10 @@ public class TestRewriteTablePathsAction extends TestBase {
     Snapshot oldest = SnapshotUtil.oldestAncestor(tableWith3Snaps);
     String oldestDataFilePath =
         Iterables.getOnlyElement(
-                tableWith3Snaps.snapshot(oldest.snapshotId()).addedDataFiles(tableWith3Snaps.io()))
+                SnapshotChanges.builderFor(tableWith3Snaps)
+                    .snapshot(tableWith3Snaps.snapshot(oldest.snapshotId()))
+                    .build()
+                    .addedDataFiles())
             .location();
     String deletedDataFilePathInTargetLocation =
         String.format("%sdata/%s", targetTableLocation(), fileName(oldestDataFilePath));
@@ -698,7 +1134,7 @@ public class TestRewriteTablePathsAction extends TestBase {
     assertThat(copiedEntries).contains(deletedDataFilePathInTargetLocation);
   }
 
-  @Test
+  @TestTemplate
   public void testStartSnapshotWithoutValidSnapshot() throws Exception {
     // expire one snapshot
     actions().expireSnapshots(table).expireSnapshotId(table.currentSnapshot().parentId()).execute();
@@ -717,7 +1153,7 @@ public class TestRewriteTablePathsAction extends TestBase {
     checkFileNum(2, 1, 1, 5, result);
   }
 
-  @Test
+  @TestTemplate
   public void testMoveTheVersionExpireSnapshot() throws Exception {
     // expire one snapshot
     actions().expireSnapshots(table).expireSnapshotId(table.currentSnapshot().parentId()).execute();
@@ -735,7 +1171,7 @@ public class TestRewriteTablePathsAction extends TestBase {
     checkFileNum(1, 0, 0, 1, result);
   }
 
-  @Test
+  @TestTemplate
   public void testMoveVersionWithInvalidSnapshots() {
     // expire one snapshot
     actions().expireSnapshots(table).expireSnapshotId(table.currentSnapshot().parentId()).execute();
@@ -754,7 +1190,7 @@ public class TestRewriteTablePathsAction extends TestBase {
                 + "Please choose an earlier version without invalid snapshots.");
   }
 
-  @Test
+  @TestTemplate
   public void testRollBack() throws Exception {
     long secondSnapshotId = table.currentSnapshot().snapshotId();
 
@@ -781,7 +1217,7 @@ public class TestRewriteTablePathsAction extends TestBase {
     checkFileNum(6, 3, 3, 15, result);
   }
 
-  @Test
+  @TestTemplate
   public void testWriteAuditPublish() throws Exception {
     // enable WAP
     table.updateProperties().set(TableProperties.WRITE_AUDIT_PUBLISH_ENABLED, "true").commit();
@@ -806,7 +1242,7 @@ public class TestRewriteTablePathsAction extends TestBase {
     checkFileNum(5, 3, 3, 14, result);
   }
 
-  @Test
+  @TestTemplate
   public void testSchemaChange() throws Exception {
     // change the schema
     table.updateSchema().addColumn("c4", Types.StringType.get()).commit();
@@ -823,7 +1259,7 @@ public class TestRewriteTablePathsAction extends TestBase {
     checkFileNum(4, 2, 2, 10, result);
   }
 
-  @Test
+  @TestTemplate
   public void testSnapshotIdInheritanceEnabled() throws Exception {
     String sourceTableLocation = newTableLocation();
     Map<String, String> properties = Maps.newHashMap();
@@ -841,7 +1277,7 @@ public class TestRewriteTablePathsAction extends TestBase {
     checkFileNum(3, 2, 2, 9, result);
   }
 
-  @Test
+  @TestTemplate
   public void testMetadataCompression() throws Exception {
     String sourceTableLocation = newTableLocation();
     Map<String, String> properties = Maps.newHashMap();
@@ -867,7 +1303,7 @@ public class TestRewriteTablePathsAction extends TestBase {
     checkFileNum(2, 2, 2, 8, result);
   }
 
-  @Test
+  @TestTemplate
   public void testInvalidArgs() {
     RewriteTablePath actions = actions().rewriteTablePath(table);
 
@@ -900,12 +1336,12 @@ public class TestRewriteTablePathsAction extends TestBase {
         .hasMessageContaining("End version('null') cannot be empty");
   }
 
-  @Test
+  @TestTemplate
   public void testTableWithManyPartitionStatisticFile() throws IOException {
     String sourceTableLocation = newTableLocation();
-    Map<String, String> properties = Maps.newHashMap();
-    properties.put("format-version", "2");
-    String tableName = "v2tblwithPartStats";
+    Map<String, String> properties =
+        ImmutableMap.of(TableProperties.FORMAT_VERSION, String.valueOf(formatVersion));
+    String tableName = String.format("v%stblwithPartStats", formatVersion);
     Table sourceTable =
         createMetastoreTable(sourceTableLocation, properties, "default", tableName, 0, "c1");
 
@@ -932,12 +1368,12 @@ public class TestRewriteTablePathsAction extends TestBase {
         result, "partition-stats", sourceTableLocation, targetTableLocation);
   }
 
-  @Test
+  @TestTemplate
   public void testTableWithManyStatisticFiles() throws IOException {
     String sourceTableLocation = newTableLocation();
-    Map<String, String> properties = Maps.newHashMap();
-    properties.put("format-version", "2");
-    String tableName = "v2tblwithmanystats";
+    Map<String, String> properties =
+        ImmutableMap.of(TableProperties.FORMAT_VERSION, String.valueOf(formatVersion));
+    String tableName = String.format("v%stblwithmanystats", formatVersion);
     Table sourceTable =
         createMetastoreTable(sourceTableLocation, properties, "default", tableName, 0);
 
@@ -961,12 +1397,12 @@ public class TestRewriteTablePathsAction extends TestBase {
         iterations * 2 + 1, iterations, iterations, iterations, iterations * 6 + 1, result);
   }
 
-  @Test
+  @TestTemplate
   public void testStatisticsFileSourcePath() throws IOException {
     String sourceTableLocation = newTableLocation();
-    Map<String, String> properties = Maps.newHashMap();
-    properties.put("format-version", "2");
-    String tableName = "v2tblwithstats";
+    Map<String, String> properties =
+        ImmutableMap.of(TableProperties.FORMAT_VERSION, String.valueOf(formatVersion));
+    String tableName = String.format("v%stblwithstats", formatVersion);
     Table sourceTable =
         createMetastoreTable(sourceTableLocation, properties, "default", tableName, 1);
 
@@ -989,13 +1425,17 @@ public class TestRewriteTablePathsAction extends TestBase {
     findAndAssertFileInFileList(result, ".stats", sourceTableLocation, targetTableLocation);
   }
 
-  @Test
+  @TestTemplate
   public void testMetadataCompressionWithMetastoreTable() throws Exception {
     Map<String, String> properties = Maps.newHashMap();
     properties.put(TableProperties.METADATA_COMPRESSION, "gzip");
     Table sourceTable =
         createMetastoreTable(
-            newTableLocation(), properties, "default", "testMetadataCompression", 2);
+            newTableLocation(),
+            properties,
+            "default",
+            String.format("v%sMetadataCompression", formatVersion),
+            2);
 
     TableMetadata currentMetadata = currentMetadata(sourceTable);
 
@@ -1023,10 +1463,11 @@ public class TestRewriteTablePathsAction extends TestBase {
   }
 
   // Metastore table tests
-  @Test
+  @TestTemplate
   public void testMetadataLocationChange() throws Exception {
+    String tableName = String.format("v%stblWithLocation", formatVersion);
     Table sourceTable =
-        createMetastoreTable(newTableLocation(), Maps.newHashMap(), "default", "tbl", 1);
+        createMetastoreTable(newTableLocation(), Maps.newHashMap(), "default", tableName, 1);
     String metadataFilePath = currentMetadata(sourceTable).metadataFileLocation();
 
     String newMetadataDir = "new-metadata-dir";
@@ -1035,7 +1476,7 @@ public class TestRewriteTablePathsAction extends TestBase {
         .set(TableProperties.WRITE_METADATA_LOCATION, newTableLocation() + newMetadataDir)
         .commit();
 
-    spark.sql("insert into hive.default.tbl values (1, 'AAAAAAAAAA', 'AAAA')");
+    sql("insert into hive.default.%s values (1, 'AAAAAAAAAA', 'AAAA')", tableName);
     sourceTable.refresh();
 
     // copy table
@@ -1068,12 +1509,15 @@ public class TestRewriteTablePathsAction extends TestBase {
     checkFileNum(2, 1, 1, 5, result2);
   }
 
-  @Test
+  @TestTemplate
   public void testDeleteFrom() throws Exception {
-    Map<String, String> properties = Maps.newHashMap();
-    properties.put("format-version", "2");
-    properties.put("write.delete.mode", "merge-on-read");
-    String tableName = "v2tbl";
+    Map<String, String> properties =
+        ImmutableMap.of(
+            TableProperties.FORMAT_VERSION,
+            String.valueOf(formatVersion),
+            "write.delete.mode",
+            "merge-on-read");
+    String tableName = String.format("v%stbl", formatVersion);
     Table sourceTable =
         createMetastoreTable(newTableLocation(), properties, "default", tableName, 0);
     // ingest data
@@ -1121,7 +1565,7 @@ public class TestRewriteTablePathsAction extends TestBase {
     // register table
     String metadataLocation = currentMetadata(sourceTable).metadataFileLocation();
     String versionFile = fileName(metadataLocation);
-    String targetTableName = "copiedV2Table";
+    String targetTableName = String.format("copiedV%sTable", formatVersion);
     TableIdentifier tableIdentifier = TableIdentifier.of("default", targetTableName);
     catalog.registerTable(tableIdentifier, targetTableLocation() + "/metadata/" + versionFile);
 
@@ -1137,7 +1581,7 @@ public class TestRewriteTablePathsAction extends TestBase {
     assertEquals("Rows must match", originalData, copiedData);
   }
 
-  @Test
+  @TestTemplate
   public void testKryoDeserializeBroadcastValues() {
     sparkContext.getConf().set("spark.serializer", "org.apache.spark.serializer.KryoSerializer");
     RewriteTablePathSparkAction action =
@@ -1148,35 +1592,25 @@ public class TestRewriteTablePathsAction extends TestBase {
     assertThat(tableBroadcast.getValue().uuid()).isEqualTo(table.uuid());
   }
 
-  @Test
+  @TestTemplate
   public void testNestedDirectoryStructurePreservation() throws Exception {
+    assumeThat(formatVersion)
+        .as("Can't add multiple DVs for the same data file in v3")
+        .isEqualTo(2);
     String sourceTableLocation = newTableLocation();
     Table sourceTable = createTableWithSnapshots(sourceTableLocation, 1);
 
     // Create position delete files with same names in different nested directories
     // This simulates the scenario tested in
     // TestRewriteTablePathUtil.testStagingPathPreservesDirectoryStructure
+    SnapshotChanges sourceChanges = SnapshotChanges.builderFor(sourceTable).build();
     List<Pair<CharSequence, Long>> deletes1 =
         Lists.newArrayList(
-            Pair.of(
-                sourceTable
-                    .currentSnapshot()
-                    .addedDataFiles(sourceTable.io())
-                    .iterator()
-                    .next()
-                    .location(),
-                0L));
+            Pair.of(sourceChanges.addedDataFiles().iterator().next().location(), 0L));
 
     List<Pair<CharSequence, Long>> deletes2 =
         Lists.newArrayList(
-            Pair.of(
-                sourceTable
-                    .currentSnapshot()
-                    .addedDataFiles(sourceTable.io())
-                    .iterator()
-                    .next()
-                    .location(),
-                0L));
+            Pair.of(sourceChanges.addedDataFiles().iterator().next().location(), 0L));
 
     // Create delete files with same name in different nested paths (hash1/ and hash2/)
     File file1 =
@@ -1186,12 +1620,18 @@ public class TestRewriteTablePathsAction extends TestBase {
 
     DeleteFile positionDeletes1 =
         FileHelpers.writeDeleteFile(
-                sourceTable, sourceTable.io().newOutputFile(file1.toURI().toString()), deletes1)
+                sourceTable,
+                sourceTable.io().newOutputFile(file1.toURI().toString()),
+                deletes1,
+                formatVersion)
             .first();
 
     DeleteFile positionDeletes2 =
         FileHelpers.writeDeleteFile(
-                sourceTable, sourceTable.io().newOutputFile(file2.toURI().toString()), deletes2)
+                sourceTable,
+                sourceTable.io().newOutputFile(file2.toURI().toString()),
+                deletes2,
+                formatVersion)
             .first();
 
     sourceTable.newRowDelta().addDeletes(positionDeletes1).commit();
@@ -1235,7 +1675,7 @@ public class TestRewriteTablePathsAction extends TestBase {
     assertThat(targetPath2).startsWith(targetTableLocation());
   }
 
-  @Test
+  @TestTemplate
   public void testRewritePathWithoutCreateFileList() throws Exception {
     String targetTableLocation = targetTableLocation();
 
@@ -1251,6 +1691,28 @@ public class TestRewriteTablePathsAction extends TestBase {
     assertThat(result.fileListLocation())
         .as("File list location should not be set when createFileList is false")
         .isEqualTo(NOT_APPLICABLE);
+  }
+
+  @TestTemplate
+  public void testRewritePathWithExecutorService() throws Exception {
+    String sourceLocation = newTableLocation();
+    Table sourceTable = createTableWithSnapshots(sourceLocation, 50);
+
+    ExecutorService service = Executors.newFixedThreadPool(4);
+    try {
+      sourceTable.refresh();
+      RewriteTablePath.Result result =
+          actions()
+              .rewriteTablePath(sourceTable)
+              .rewriteLocationPrefix(sourceLocation, targetTableLocation())
+              .startVersion("v1.metadata.json")
+              .executeWith(service)
+              .execute();
+
+      checkFileNum(50, 50, 50, 200, result);
+    } finally {
+      service.shutdown();
+    }
   }
 
   protected void checkFileNum(
@@ -1295,10 +1757,7 @@ public class TestRewriteTablePathsAction extends TestBase {
             .as(Encoders.STRING())
             .collectAsList();
     Predicate<String> isManifest =
-        f ->
-            (f.contains("optimized-m-") && f.endsWith(".avro"))
-                || f.endsWith("-m0.avro")
-                || f.endsWith("-m1.avro");
+        f -> f.contains("optimized-m-") || f.contains("-m0.") || f.contains("-m1.");
     Predicate<String> isManifestList = f -> f.contains("snap-") && f.endsWith(".avro");
     Predicate<String> isMetadataJSON = f -> f.endsWith(".metadata.json");
 
